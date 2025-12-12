@@ -1,16 +1,20 @@
+# processor.py
 import argparse
 import json
 import logging
 import os
 import shutil
 import time
+import base64
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Any, Dict, List, Tuple
-
+import math
 import pandas as pd
 from google import genai
 from google.genai import types
 from openpyxl import load_workbook
+from openpyxl import Workbook
 
 # Константы выходных колонок артефакта 1
 RESULT_COLUMNS = {
@@ -33,6 +37,7 @@ class PipelineConfig:
     gemini_model: str = "gemini-2.0-flash"
     log_dir: str = "logs"
     state_dir: str = "snapshots"
+    overwrite_input: bool = False
 
     @classmethod
     def from_env_and_args(cls) -> "PipelineConfig":
@@ -45,9 +50,15 @@ class PipelineConfig:
         parser.add_argument("--log-dir", dest="log_dir", default=os.getenv("LOG_DIR", "logs"))
         parser.add_argument("--state-dir", dest="state_dir", default=os.getenv("STATE_DIR", "snapshots"))
         parser.add_argument("--api-key", dest="gemini_api_key", default=os.getenv("GEMINI_API_KEY", ""))
+        parser.add_argument(
+            "--overwrite-input",
+            dest="overwrite_input",
+            action="store_true",
+            default=os.getenv("OVERWRITE_INPUT", "false").lower() in ("1", "true", "yes"),
+            help="Если задан, после каждого батча перезаписывать input.xlsx текущим output.xlsx",
+        )
 
         args = parser.parse_args()
-
         api_key = args.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
         if not api_key:
             raise ValueError("GEMINI_API_KEY обязателен (env или --api-key).")
@@ -65,11 +76,11 @@ class PipelineConfig:
             gemini_model=args.gemini_model,
             log_dir=args.log_dir,
             state_dir=args.state_dir,
+            overwrite_input=args.overwrite_input,
         )
 
 
 def ensure_output_workbook(input_path: str, output_path: str) -> None:
-    """Если output отсутствует — копируем input, иначе используем существующий для возобновления."""
     if not os.path.exists(output_path):
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         shutil.copyfile(input_path, output_path)
@@ -89,10 +100,55 @@ def load_dataframe(output_path: str, process_sheet: str) -> pd.DataFrame:
     return df
 
 
-def is_row_processed(row: pd.Series) -> bool:
-    if str(row.get("status", "")).strip().lower() == "done":
+def _is_empty_cell(value: Any) -> bool:
+    """
+    Возвращает True, если значение считается пустым:
+    - None
+    - numpy.nan / float('nan')
+    - пустая строка (после strip)
+    """
+    if value is None:
         return True
-    return all(str(row.get(col, "")).strip() != "" for col in RESULT_COLUMNS.values())
+    # pandas / numpy NaN проверяем через math.isnan для чисел, или через pandas.isna
+    try:
+        # Это сработает для np.nan и для float('nan')
+        if isinstance(value, float) and math.isnan(value):
+            return True
+    except Exception:
+        pass
+    # pandas uses pd.isna for complex types
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    # Finally, empty string after strip
+    try:
+        if isinstance(value, str) and value.strip() == "":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_row_processed(row: pd.Series) -> bool:
+    """
+    Строка считается обработанной если:
+    - статус == 'done' (регистронезависимо)
+    ИЛИ
+    - все целевые колонки RESULT_COLUMNS заполнены (т.е. НЕ пусты по _is_empty_cell)
+    """
+    status = row.get("status", "")
+    if isinstance(status, str) and status.strip().lower() == "done":
+        return True
+
+    for col in RESULT_COLUMNS.values():
+        val = row.get(col, "")
+        if _is_empty_cell(val):
+            # как только находим пустую целевую колонку — строка НЕ обработана
+            return False
+    # все целевые колонки непустые — строка обработана
+    return True
 
 
 def select_batch(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
@@ -100,7 +156,66 @@ def select_batch(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
     return unprocessed.head(batch_size)
 
 
+def _normalize(name: str) -> str:
+    """
+    Нормализует имя колонки: убирает пробелы, переносы строк, кавычки,
+    скобки, приводит к нижнему регистру — для нечувствительного поиска.
+    """
+    if not isinstance(name, str):
+        return ""
+    # Убираем пробелы, переносы строк, кавычки и круглые скобки, слэши и прочие
+    normalized = "".join(ch for ch in name.lower() if ch.isalnum())
+    return normalized
+
+
+def _ensure_columns(batch_df: pd.DataFrame, required_cols: List[str]) -> pd.DataFrame:
+    """
+    Для каждого required_cols пытаемся найти в batch_df похожую колонку (по нормализованному имени).
+    Если найдено — копируем её под стандартным именем required_cols[i].
+    Если не найдено — создаём пустую колонку с этим именем.
+    Возвращаем модифицированный batch_df.
+    """
+    # Создаём индекс нормализованных существующих колонок -> оригинальные имена
+    norm_map = {}
+    for col in batch_df.columns:
+        norm = _normalize(col)
+        if norm:
+            norm_map[norm] = col
+
+    for required in required_cols:
+        req_norm = _normalize(required)
+        if req_norm in norm_map:
+            orig = norm_map[req_norm]
+            if orig != required:
+                # Копируем/переименовываем в новую колонку с каноническим именем
+                batch_df[required] = batch_df[orig]
+                logging.info("Сопоставлена колонка '%s' -> '%s'.", orig, required)
+        else:
+            # Попробуем более либеральный поиск: смотрим, есть ли существующая колонка,
+            # содержащая ключевые слова из required (например 'mirapolis' и 'l4')
+            words = [w for w in "".join(ch if ch.isalnum() else " " for ch in required.lower()).split() if len(w) > 2]
+            found = None
+            for col in batch_df.columns:
+                col_low = col.lower()
+                if all(word in col_low for word in words):
+                    found = col
+                    break
+            if found:
+                batch_df[required] = batch_df[found]
+                logging.info("Либерально сопоставлена колонка '%s' -> '%s'.", found, required)
+            else:
+                # Создаём пустую колонку
+                batch_df[required] = ""
+                logging.warning("Колонка '%s' не найдена — создана пустая колонка.", required)
+
+    return batch_df
+
+
 def build_batch_payload(batch_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Построение JSON-пейлоада для батча. Функция теперь толерантна к названиям колонок:
+    она попытается сопоставить нужные колонки по нормализованным именам и создать недостающие.
+    """
     required_cols = [
         "L1",
         "L2",
@@ -115,10 +230,11 @@ def build_batch_payload(batch_df: pd.DataFrame) -> List[Dict[str, Any]]:
         "Предложение по решению /улучшению HCM",
         "Функциональные требования",
     ]
-    for col in required_cols:
-        if col not in batch_df.columns:
-            raise KeyError(f"Отсутствует обязательная колонка '{col}' в листе процесса.")
 
+    # Приводим batch_df к версии с гарантированными колонками
+    batch_df = _ensure_columns(batch_df, required_cols)
+
+    # Теперь строим payload (как раньше), опираясь на стандартные имена
     payload = []
     for idx, row in batch_df.iterrows():
         excel_row_index = int(idx) + 2  # +2: смещение на заголовок
@@ -161,9 +277,7 @@ class GeminiClient:
         os.makedirs(self.log_dir, exist_ok=True)
 
     def call(self, prompt_text: str, batch_json: List[Dict[str, Any]], batch_idx: int) -> Dict[str, Any]:
-        system_instruction = (
-            "Верни только валидный JSON, без markdown, без пояснений, без текста вокруг. Язык значений — русский."
-        )
+        system_instruction = "Верни только валидный JSON, без markdown, без пояснений, без текста вокруг. Язык значений — русский."
         contract = {
             "artifact1_rows": [
                 {
@@ -210,9 +324,7 @@ class GeminiClient:
 
         for attempt in range(3):
             try:
-                response = self.client.models.generate_content(
-                    model=self.model_name, contents=[full_prompt], config=self.config
-                )
+                response = self.client.models.generate_content(model=self.model_name, contents=[full_prompt], config=self.config)
                 response_text = (response.text or "").strip()
                 with open(raw_log, "w", encoding="utf-8") as f:
                     f.write(response_text)
@@ -223,15 +335,55 @@ class GeminiClient:
                     if cleaned.lower().startswith("json"):
                         cleaned = cleaned[4:].strip()
 
-                parsed = json.loads(cleaned)
+                # First try to parse JSON
+                try:
+                    parsed = json.loads(cleaned)
+                except Exception:
+                    # If parsing fails, maybe it's raw base64 xlsx
+                    text = cleaned.strip()
+                    if len(text) > 300 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r" for c in text[:200]):
+                        try:
+                            xbytes = base64.b64decode(text)
+                            filled_path = os.path.join(self.log_dir, f"batch_{batch_idx}_filled_from_gemini.xlsx")
+                            wb = load_workbook(filename=BytesIO(xbytes))
+                            wb.save(filled_path)
+                            # Write a minimal parsed log
+                            with open(parsed_log, "w", encoding="utf-8") as f:
+                                json.dump({"filled_xlsx_path": filled_path}, f, ensure_ascii=False, indent=2)
+                            return {"filled_xlsx_path": filled_path}
+                        except Exception:
+                            raise
+
+                    raise
+
+                # If parsed is dict and contains filled_xlsx_base64
+                if isinstance(parsed, dict) and "filled_xlsx_base64" in parsed:
+                    try:
+                        b64 = parsed["filled_xlsx_base64"]
+                        xbytes = base64.b64decode(b64)
+                        filled_path = os.path.join(self.log_dir, f"batch_{batch_idx}_filled_from_gemini.xlsx")
+                        wb = load_workbook(filename=BytesIO(xbytes))
+                        wb.save(filled_path)
+                        parsed_no_b64 = dict(parsed)
+                        parsed_no_b64.pop("filled_xlsx_base64", None)
+                        parsed_no_b64["_filled_xlsx_path"] = filled_path
+                        with open(parsed_log, "w", encoding="utf-8") as f:
+                            json.dump(parsed_no_b64, f, ensure_ascii=False, indent=2)
+                        return {"filled_xlsx_path": filled_path, **parsed_no_b64}
+                    except Exception as exc:
+                        logging.warning("Ошибка декодирования base64 xlsx: %s", exc)
+                        raise
+
+                # Normal JSON case
                 with open(parsed_log, "w", encoding="utf-8") as f:
                     json.dump(parsed, f, ensure_ascii=False, indent=2)
                 return parsed
+
             except Exception as exc:
                 logging.warning("Gemini ошибка, попытка %s: %s", attempt + 1, exc)
                 time.sleep(2 * (attempt + 1))
 
-        raise RuntimeError("Не удалось получить валидный JSON от Gemini после 3 попыток.")
+        raise RuntimeError("Не удалось получить валидный JSON/файл от Gemini после 3 попыток.")
 
 
 def ensure_result_columns(wb, process_sheet: str) -> None:
@@ -276,6 +428,58 @@ def merge_artifact2_sheet(wb, artifact2: List[Dict[str, Any]]) -> None:
         ws.append(list(row))
 
 
+def merge_workbooks_preserve(old_wb: Workbook, new_wb: Workbook, process_sheet_name: str):
+    """
+    Переносит непустые значения из new_wb в old_wb для sheet process_sheet_name.
+    Добавляет колонки из new_wb, если их нет в old_wb.
+    Объединяет ARTIFACT2_SHEET с дедупом.
+    """
+    if process_sheet_name not in new_wb.sheetnames:
+        return
+
+    old_ws = old_wb[process_sheet_name]
+    new_ws = new_wb[process_sheet_name]
+
+    header_to_col_old = {cell.value: cell.column for cell in old_ws[1]}
+    header_to_col_new = {cell.value: cell.column for cell in new_ws[1]}
+
+    # Добавляем отсутствующие колонки
+    for col_name in header_to_col_new.keys():
+        if col_name not in header_to_col_old:
+            old_ws.cell(row=1, column=old_ws.max_column + 1).value = col_name
+            header_to_col_old[col_name] = old_ws.max_column
+
+    # Перенос непустых значений
+    for r in range(2, new_ws.max_row + 1):
+        for col_name, new_col_idx in header_to_col_new.items():
+            new_val = new_ws.cell(row=r, column=new_col_idx).value
+            if new_val is not None and str(new_val).strip() != "":
+                old_col_idx = header_to_col_old[col_name]
+                old_ws.cell(row=r, column=old_col_idx).value = new_val
+
+    # Объединение ФТ Mirapolis
+    if ARTIFACT2_SHEET in new_wb.sheetnames:
+        if ARTIFACT2_SHEET not in old_wb.sheetnames:
+            old_ws2 = old_wb.create_sheet(ARTIFACT2_SHEET)
+            old_ws2.append(["L2", "Категория", "Требование"])
+        else:
+            old_ws2 = old_wb[ARTIFACT2_SHEET]
+        new_ws2 = new_wb[ARTIFACT2_SHEET]
+
+        existing = set()
+        for l2, cat, req in old_ws2.iter_rows(min_row=2, values_only=True):
+            existing.add(((l2 or ""), (cat or ""), (req or "")))
+
+        for r in range(2, new_ws2.max_row + 1):
+            l2 = new_ws2.cell(row=r, column=1).value or ""
+            cat = new_ws2.cell(row=r, column=2).value or ""
+            req = new_ws2.cell(row=r, column=3).value or ""
+            candidate = (l2, cat, req)
+            if candidate not in existing:
+                old_ws2.append(list(candidate))
+                existing.add(candidate)
+
+
 def update_dataframe_with_artifact1(df: pd.DataFrame, artifact_rows: List[Dict[str, Any]]) -> None:
     for item in artifact_rows:
         df_idx = int(item["row_index"]) - 2
@@ -313,18 +517,64 @@ def process_excel(cfg: PipelineConfig) -> None:
         with open(cfg.prompt_file, "r", encoding="utf-8") as f:
             prompt_text = f.read()
 
+        # Сохраняем pre-batch CSV
+        pre_batch_csv = os.path.join(cfg.log_dir, f"batch_{batch_idx}_pre.csv")
+        batch_df.to_csv(pre_batch_csv, index=False, encoding="utf-8-sig")
+        logging.info("Сохранили входной CSV батча: %s", pre_batch_csv)
+
         response = client.call(prompt_text, payload, batch_idx)
-        artifact1_rows = response.get("artifact1_rows", [])
-        artifact2_by_l2 = response.get("artifact2_by_l2", [])
 
-        apply_artifact1_rows(wb, process_sheet, artifact1_rows)
-        update_dataframe_with_artifact1(df, artifact1_rows)
-        merge_artifact2_sheet(wb, artifact2_by_l2)
+        # Если Gemini вернул файл xlsx
+        if isinstance(response, dict) and response.get("filled_xlsx_path"):
+            filled_path = response["filled_xlsx_path"]
+            logging.info("Gemini вернул готовый XLSX: %s. Выполняю merge.", filled_path)
+            new_wb = load_workbook(filled_path)
+            merge_workbooks_preserve(wb, new_wb, process_sheet)
+            wb.save(cfg.output_xlsx)
 
-        wb.save(cfg.output_xlsx)
-        snapshot_path = os.path.join(cfg.state_dir, f"output_batch_{batch_idx}.xlsx")
-        wb.save(snapshot_path)
-        logging.info("Батч %s обработан, снапшот: %s", batch_idx, snapshot_path)
+            # Если в parsed были данные artifact1/2 — применяем их (если есть)
+            artifact1_rows = response.get("artifact1_rows", [])
+            if artifact1_rows:
+                apply_artifact1_rows(wb, process_sheet, artifact1_rows)
+                update_dataframe_with_artifact1(df, artifact1_rows)
+            artifact2_by_l2 = response.get("artifact2_by_l2", [])
+            if artifact2_by_l2:
+                merge_artifact2_sheet(wb, artifact2_by_l2)
+
+            wb.save(cfg.output_xlsx)
+            snapshot_path = os.path.join(cfg.state_dir, f"output_batch_{batch_idx}.xlsx")
+            wb.save(snapshot_path)
+            logging.info("Батч %s обработан (xlsx-ответ), снапшот: %s", batch_idx, snapshot_path)
+            # Обновляем df из нового output
+            df = load_dataframe(cfg.output_xlsx, process_sheet)
+
+        else:
+            # Обычная логика: JSON-ответы
+            artifact1_rows = response.get("artifact1_rows", [])
+            artifact2_by_l2 = response.get("artifact2_by_l2", [])
+            apply_artifact1_rows(wb, process_sheet, artifact1_rows)
+            update_dataframe_with_artifact1(df, artifact1_rows)
+            merge_artifact2_sheet(wb, artifact2_by_l2)
+
+            wb.save(cfg.output_xlsx)
+            snapshot_path = os.path.join(cfg.state_dir, f"output_batch_{batch_idx}.xlsx")
+            wb.save(snapshot_path)
+            logging.info("Батч %s обработан, снапшот: %s", batch_idx, snapshot_path)
+
+        # Сохраняем пост-batch CSV
+        post_batch_csv = os.path.join(cfg.log_dir, f"batch_{batch_idx}_post.csv")
+        df.to_csv(post_batch_csv, index=False, encoding="utf-8-sig")
+        logging.info("Сохранили выходной CSV батча: %s", post_batch_csv)
+
+        # Если требуется перезаписать input.xlsx текущим output
+        if cfg.overwrite_input:
+            try:
+                if os.path.abspath(cfg.input_xlsx) != os.path.abspath(cfg.output_xlsx):
+                    shutil.copyfile(cfg.output_xlsx, cfg.input_xlsx)
+                    logging.info("Перезаписан исходный файл input.xlsx новой версией output.xlsx")
+            except Exception as exc:
+                logging.warning("Не удалось перезаписать input.xlsx: %s", exc)
+
         batch_idx += 1
 
 
@@ -336,4 +586,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
