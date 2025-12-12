@@ -1,0 +1,12 @@
+# Файл: requirements.txt
+
+# Основной SDK для взаимодействия с Google Gemini API
+google-genai
+
+# Библиотека для анализа и манипуляции данными,
+# необходима для чтения/записи XLSX и CSV файлов
+pandas
+
+# Движок, который используется pandas для работы с .xlsx файлами
+openpyxl
+pytest
