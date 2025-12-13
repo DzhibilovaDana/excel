@@ -381,7 +381,7 @@ class GeminiClient:
 
             except Exception as exc:
                 logging.warning("Gemini ошибка, попытка %s: %s", attempt + 1, exc)
-                time.sleep(2 * (attempt + 1))
+                time.sleep(15)
 
         raise RuntimeError("Не удалось получить валидный JSON/файл от Gemini после 3 попыток.")
 
