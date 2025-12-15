@@ -24,6 +24,33 @@ RESULT_COLUMNS = {
     "mirapolis_action": "Действие в системе",
 }
 
+REQUIRED_INPUT_COLS = [
+    "L1",
+    "L2",
+    "L3",
+    "L4",
+    "L5",
+    "Mirapolis L4 (Да/Нет)",
+    "Ответ Клиента",
+    "Комментарии/уточнения",
+    "Комментарии со встреч",
+    "Проблема текущего состояния",
+    "Предложение по решению /улучшению HCM",
+    "Функциональные требования",
+]
+
+ALIASES = {
+    "Предложение по решению /улучшению HCM": [
+        "Предожение по решению /улучшению HCM",  # опечатка
+        "Предложение по решению /улучшению HCM \nОфис\nМасс\nПервичные"
+    ],
+    "Ответ Клиента": [
+        "Ответ Агроэко L4 в «Агроэко»\nОфис\nМасс"
+    ],
+    "Mirapolis L4 (Да/Нет)": ["Mirapolis L4"]
+}
+
+
 ARTIFACT2_SHEET = "ФТ Mirapolis"
 
 
@@ -93,11 +120,22 @@ def get_process_sheet_name(workbook) -> str:
 def load_dataframe(output_path: str, process_sheet: str) -> pd.DataFrame:
     df = pd.read_excel(output_path, sheet_name=process_sheet)
     df = df.reset_index(drop=True)
+
+    # Убедимся, что все результирующие колонки присутствуют и имеют object dtype,
+    # а NaN заменены пустыми строками.
     for col in RESULT_COLUMNS.values():
         if col not in df.columns:
             df[col] = ""
+        else:
+            # Приводим колонку к object и заполняем NaN пустыми строками
+            df[col] = df[col].astype(object).fillna("")
+
+    # status
     df["status"] = df.get("status", "")
+    df["status"] = df["status"].astype(object).fillna("")
+
     return df
+
 
 
 def _is_empty_cell(value: Any) -> bool:
@@ -155,60 +193,141 @@ def select_batch(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
     unprocessed = df[~df.apply(is_row_processed, axis=1)]
     return unprocessed.head(batch_size)
 
-
 def _normalize(name: str) -> str:
-    """
-    Нормализует имя колонки: убирает пробелы, переносы строк, кавычки,
-    скобки, приводит к нижнему регистру — для нечувствительного поиска.
-    """
     if not isinstance(name, str):
         return ""
-    # Убираем пробелы, переносы строк, кавычки и круглые скобки, слэши и прочие
-    normalized = "".join(ch for ch in name.lower() if ch.isalnum())
-    return normalized
+    s = name.lower()
+    return "".join(ch for ch in s if ch.isalnum())
+
+def build_header_map(ws):
+    """
+    Возвращает dict: normalized_name -> (original_name, column_index)
+    """
+    header_map = {}
+    for cell in ws[1]:
+        orig = cell.value if cell.value is not None else ""
+        norm = _normalize(str(orig))
+        header_map[norm] = (orig, cell.column)
+    return header_map
 
 
 def _ensure_columns(batch_df: pd.DataFrame, required_cols: List[str]) -> pd.DataFrame:
     """
-    Для каждого required_cols пытаемся найти в batch_df похожую колонку (по нормализованному имени).
-    Если найдено — копируем её под стандартным именем required_cols[i].
-    Если не найдено — создаём пустую колонку с этим именем.
-    Возвращаем модифицированный batch_df.
+    Убедиться, что в batch_df есть все required_cols.
+    - Если найдена существующая колонка с похожим именем — скопировать её под каноническим именем.
+    - Иначе — создать пустую колонку с этим именем.
+    Возвращает изменённый batch_df.
     """
-    # Создаём индекс нормализованных существующих колонок -> оригинальные имена
+    # Нормализованная карта существующих колонок: norm -> original_name
     norm_map = {}
     for col in batch_df.columns:
-        norm = _normalize(col)
+        try:
+            col_str = str(col)
+        except Exception:
+            continue
+        norm = _normalize_header(col_str)
         if norm:
             norm_map[norm] = col
 
-    for required in required_cols:
-        req_norm = _normalize(required)
+    for req in required_cols:
+        req_norm = _normalize_header(req)
         if req_norm in norm_map:
             orig = norm_map[req_norm]
-            if orig != required:
-                # Копируем/переименовываем в новую колонку с каноническим именем
-                batch_df[required] = batch_df[orig]
-                logging.info("Сопоставлена колонка '%s' -> '%s'.", orig, required)
+            if orig != req:
+                # копируем колонку под каноническим именем
+                batch_df[req] = batch_df[orig]
+                logging.info("Сопоставлена колонка '%s' -> '%s'.", orig, req)
+            # если orig == req — колонка уже с правильным именем
         else:
-            # Попробуем более либеральный поиск: смотрим, есть ли существующая колонка,
-            # содержащая ключевые слова из required (например 'mirapolis' и 'l4')
-            words = [w for w in "".join(ch if ch.isalnum() else " " for ch in required.lower()).split() if len(w) > 2]
+            # Либеральный поиск по словам (например: переносы строк, доп слова)
+            words = [w for w in "".join(ch if ch.isalnum() else " " for ch in req.lower()).split() if len(w) > 2]
             found = None
-            for col in batch_df.columns:
-                col_low = col.lower()
-                if all(word in col_low for word in words):
-                    found = col
-                    break
+            if words:
+                for col in batch_df.columns:
+                    col_low = str(col).lower()
+                    if all(word in col_low for word in words):
+                        found = col
+                        break
             if found:
-                batch_df[required] = batch_df[found]
-                logging.info("Либерально сопоставлена колонка '%s' -> '%s'.", found, required)
+                batch_df[req] = batch_df[found]
+                logging.info("Либерально сопоставлена колонка '%s' -> '%s'.", found, req)
             else:
-                # Создаём пустую колонку
-                batch_df[required] = ""
-                logging.warning("Колонка '%s' не найдена — создана пустая колонка.", required)
+                # Создаём пустую колонку, чтобы не падать дальше
+                batch_df[req] = ""
+                logging.warning("Колонка '%s' не найдена — создана пустая колонка.", req)
 
     return batch_df
+
+
+def _normalize_header(name: str) -> str:
+    """
+    Нормализация имени колонки: приводим к нижнему регистру и оставляем только буквенно-цифровые символы.
+    Это позволяет сопоставлять заголовки, игнорируя пробелы, переносы строк, скобки, кавычки и т.п.
+    """
+    if not isinstance(name, str):
+        return ""
+    s = name.lower()
+    # убираем все не буквенно-цифровые символы
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def ensure_input_headers_in_workbook(wb, process_sheet: str, required_cols: list, aliases: dict | None = None) -> None:
+    """
+    Приводит заголовки в workbook к каноническим именам:
+    - ищет существующие колонки по нормализованным именам и по алиасам;
+    - если находит — переименовывает ячейку заголовка в каноническое имя;
+    - если не находит — добавляет новую пустую колонку с каноническим именем в конец.
+    Затем workbook нужно сохранить (вызов должен сделать вызывающий код).
+    """
+    if aliases is None:
+        aliases = {}
+
+    ws = wb[process_sheet]
+
+    # Читаем текущие заголовки
+    header_cells = list(ws[1])
+    norm_map = {}  # norm -> (col_idx, orig_name)
+    for cell in header_cells:
+        val = cell.value
+        if val is None:
+            continue
+        norm = _normalize_header(str(val))
+        if norm:
+            norm_map[norm] = (cell.column, val)
+
+    # Функция поиска: по нормализованной форме, затем по алиасам, затем по вхождению ключевых слов
+    def find_existing_column(req_name: str):
+        req_norm = _normalize_header(req_name)
+        # exact norm match
+        if req_norm in norm_map:
+            return norm_map[req_norm][0], norm_map[req_norm][1]
+        # aliases
+        if req_name in aliases:
+            for alt in aliases[req_name]:
+                alt_norm = _normalize_header(alt)
+                if alt_norm in norm_map:
+                    return norm_map[alt_norm][0], norm_map[alt_norm][1]
+        # liberal search: все слова req в кол-во >2 должны присутствовать
+        words = [w for w in "".join(ch if ch.isalnum() else " " for ch in req_name.lower()).split() if len(w) > 2]
+        if words:
+            for norm, (col_idx, orig_name) in norm_map.items():
+                low = orig_name.lower()
+                if all(word in low for word in words):
+                    return col_idx, orig_name
+        return None
+
+    # Пройти по требуемым колонкам
+    for req in required_cols:
+        found = find_existing_column(req)
+        if found:
+            col_idx, orig_name = found
+            # переименовать заголовок, если оно отличается
+            if orig_name != req:
+                ws.cell(row=1, column=col_idx).value = req
+        else:
+            # добавить новую колонку в конец
+            ws.cell(row=1, column=ws.max_column + 1).value = req
+
 
 
 def build_batch_payload(batch_df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -233,7 +352,7 @@ def build_batch_payload(batch_df: pd.DataFrame) -> List[Dict[str, Any]]:
 
     # Приводим batch_df к версии с гарантированными колонками
     batch_df = _ensure_columns(batch_df, required_cols)
-
+    logging.debug("Batch columns after ensure: %s", list(batch_df.columns))
     # Теперь строим payload (как раньше), опираясь на стандартные имена
     payload = []
     for idx, row in batch_df.iterrows():
@@ -325,38 +444,80 @@ class GeminiClient:
         for attempt in range(3):
             try:
                 response = self.client.models.generate_content(model=self.model_name, contents=[full_prompt], config=self.config)
-                response_text = (response.text or "").strip()
+
+                # --- robust extraction of textual/json content from various genai response shapes ---
+                response_text = None
+
+                # 1) Если у response есть атрибут text
+                if hasattr(response, "text"):
+                    r = getattr(response, "text")
+                    if isinstance(r, str):
+                        response_text = r.strip()
+                    else:
+                        try:
+                            response_text = json.dumps(r, ensure_ascii=False)
+                        except Exception:
+                            response_text = str(r)
+
+                # 2) Попытка извлечь из .candidates / .outputs (варианты genai)
+                if response_text is None:
+                    cand = getattr(response, "candidates", None)
+                    if cand and isinstance(cand, (list, tuple)) and len(cand) > 0:
+                        first = cand[0]
+                        if isinstance(first, dict):
+                            if "content" in first and isinstance(first["content"], (list, str)):
+                                response_text = first["content"][0] if isinstance(first["content"], list) else first["content"]
+                            elif "text" in first:
+                                response_text = first["text"]
+                            else:
+                                response_text = json.dumps(first, ensure_ascii=False)
+                        else:
+                            cont = getattr(first, "content", None)
+                            if cont and isinstance(cont, (list, tuple)) and len(cont) > 0:
+                                elem = cont[0]
+                                if isinstance(elem, dict):
+                                    response_text = elem.get("text") or json.dumps(elem, ensure_ascii=False)
+                                else:
+                                    response_text = getattr(elem, "text", str(elem))
+                            else:
+                                response_text = str(first)
+
+                # 3) Если не удалось — строкифицируем весь объект
+                if response_text is None:
+                    try:
+                        response_text = str(response)
+                    except Exception:
+                        response_text = ""
+
+                response_text = (response_text or "").strip()
                 with open(raw_log, "w", encoding="utf-8") as f:
                     f.write(response_text)
 
+                # Разчистим блок-код (```) и префиксы
                 cleaned = response_text
                 if cleaned.startswith("```"):
                     cleaned = cleaned.strip("`").strip()
                     if cleaned.lower().startswith("json"):
                         cleaned = cleaned[4:].strip()
 
-                # First try to parse JSON
+                # Попытка парсинга JSON
+                parsed = None
                 try:
                     parsed = json.loads(cleaned)
                 except Exception:
-                    # If parsing fails, maybe it's raw base64 xlsx
-                    text = cleaned.strip()
-                    if len(text) > 300 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r" for c in text[:200]):
-                        try:
-                            xbytes = base64.b64decode(text)
-                            filled_path = os.path.join(self.log_dir, f"batch_{batch_idx}_filled_from_gemini.xlsx")
-                            wb = load_workbook(filename=BytesIO(xbytes))
-                            wb.save(filled_path)
-                            # Write a minimal parsed log
-                            with open(parsed_log, "w", encoding="utf-8") as f:
-                                json.dump({"filled_xlsx_path": filled_path}, f, ensure_ascii=False, indent=2)
-                            return {"filled_xlsx_path": filled_path}
-                        except Exception:
-                            raise
+                    parsed = None
 
-                    raise
+                # Если parsed - список — приводим к ожидаемой структуре
+                if isinstance(parsed, list):
+                    logging.warning("Gemini вернул JSON-массив (list). Попытка привести к ожидаемой структуре.")
+                    if all(isinstance(el, dict) and "row_index" in el for el in parsed):
+                        parsed = {"artifact1_rows": parsed}
+                    elif all(isinstance(el, dict) and "l2_name" in el for el in parsed):
+                        parsed = {"artifact2_by_l2": parsed}
+                    else:
+                        parsed = {"raw_list": parsed}
 
-                # If parsed is dict and contains filled_xlsx_base64
+                # Если parsed — словарь и содержит base64 xlsx
                 if isinstance(parsed, dict) and "filled_xlsx_base64" in parsed:
                     try:
                         b64 = parsed["filled_xlsx_base64"]
@@ -374,10 +535,31 @@ class GeminiClient:
                         logging.warning("Ошибка декодирования base64 xlsx: %s", exc)
                         raise
 
-                # Normal JSON case
+                # Нормальный JSON-случай (словарь)
+                if isinstance(parsed, dict):
+                    logging.debug("Parsed gemini json keys: %s", list(parsed.keys()))
+                    with open(parsed_log, "w", encoding="utf-8") as f:
+                        json.dump(parsed, f, ensure_ascii=False, indent=2)
+                    return parsed
+
+                # Если не распарсили JSON — пробуем определить, не base64 ли это xlsx
+                text = cleaned.strip()
+                if len(text) > 300 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n" for c in text[:200]):
+                    try:
+                        xbytes = base64.b64decode(text)
+                        filled_path = os.path.join(self.log_dir, f"batch_{batch_idx}_filled_from_gemini.xlsx")
+                        wb = load_workbook(filename=BytesIO(xbytes))
+                        wb.save(filled_path)
+                        with open(parsed_log, "w", encoding="utf-8") as f:
+                            json.dump({"filled_xlsx_path": filled_path}, f, ensure_ascii=False, indent=2)
+                        return {"filled_xlsx_path": filled_path}
+                    except Exception:
+                        pass
+
+                # Если ничего не подошло — сохраняем raw и пробуем дальше
                 with open(parsed_log, "w", encoding="utf-8") as f:
-                    json.dump(parsed, f, ensure_ascii=False, indent=2)
-                return parsed
+                    json.dump({"raw_text": response_text}, f, ensure_ascii=False, indent=2)
+                raise RuntimeError("Не удалось получить валидный JSON/файл от Gemini после разбора.")
 
             except Exception as exc:
                 logging.warning("Gemini ошибка, попытка %s: %s", attempt + 1, exc)
@@ -386,23 +568,51 @@ class GeminiClient:
         raise RuntimeError("Не удалось получить валидный JSON/файл от Gemini после 3 попыток.")
 
 
+
 def ensure_result_columns(wb, process_sheet: str) -> None:
     ws = wb[process_sheet]
+    # Убедимся, что заголовки существуют в нужном порядке (но не портим существующие):
     headers = [cell.value for cell in ws[1]]
+    # Используем нормализованные имена для поиска
+    header_map = { _normalize(h or ""): (h, idx+1) for idx, h in enumerate(headers) }
     for col_name in RESULT_COLUMNS.values():
-        if col_name not in headers:
+        norm = _normalize(col_name)
+        if norm not in header_map:
+            # добавляем в конец
             ws.cell(row=1, column=ws.max_column + 1).value = col_name
+            logging.info("Добавлена результирующая колонка '%s' в sheet %s", col_name, process_sheet)
 
 
 def apply_artifact1_rows(wb, process_sheet: str, artifact_rows: List[Dict[str, Any]]) -> None:
     ws = wb[process_sheet]
-    header_to_col = {cell.value: cell.column for cell in ws[1]}
+    # строим карту нормализованных заголовков
+    header_map = build_header_map(ws)
+    # Для быстрых обращений: норм -> column index (если нет — создадим)
+    for canonical in RESULT_COLUMNS.values():
+        norm = _normalize(canonical)
+        if norm not in header_map:
+            ws.cell(row=1, column=ws.max_column + 1).value = canonical
+            header_map[norm] = (canonical, ws.max_column)
+            logging.info("Создана колонка результатов '%s' в листе '%s'", canonical, process_sheet)
+
+    # применяем
     for item in artifact_rows:
-        row_idx = int(item["row_index"])
-        ws.cell(row=row_idx, column=header_to_col[RESULT_COLUMNS["trigger"]]).value = item.get("trigger", "")
-        ws.cell(row=row_idx, column=header_to_col[RESULT_COLUMNS["executor"]]).value = item.get("executor", "")
-        ws.cell(row=row_idx, column=header_to_col[RESULT_COLUMNS["step_description"]]).value = item.get("step_description", "")
-        ws.cell(row=row_idx, column=header_to_col[RESULT_COLUMNS["mirapolis_action"]]).value = item.get("mirapolis_action", "")
+        try:
+            row_idx = int(item["row_index"])
+        except Exception:
+            logging.warning("Некорректный row_index в артефакте: %s", item.get("row_index"))
+            continue
+        # Запись значений
+        def write_col(key_name, value):
+            target_col_name = RESULT_COLUMNS[key_name]
+            norm = _normalize(target_col_name)
+            col_idx = header_map[norm][1]
+            ws.cell(row=row_idx, column=col_idx).value = value or ""
+
+        write_col("trigger", item.get("trigger", ""))
+        write_col("executor", item.get("executor", ""))
+        write_col("step_description", item.get("step_description", ""))
+        write_col("mirapolis_action", item.get("mirapolis_action", ""))
 
 
 def merge_artifact2_sheet(wb, artifact2: List[Dict[str, Any]]) -> None:
@@ -482,14 +692,26 @@ def merge_workbooks_preserve(old_wb: Workbook, new_wb: Workbook, process_sheet_n
 
 def update_dataframe_with_artifact1(df: pd.DataFrame, artifact_rows: List[Dict[str, Any]]) -> None:
     for item in artifact_rows:
-        df_idx = int(item["row_index"]) - 2
-        if df_idx < 0 or df_idx >= len(df):
+        try:
+            excel_row = int(item["row_index"])
+        except Exception:
+            logging.warning("Некорректный row_index в artifact_rows: %s", item.get("row_index"))
             continue
-        df.loc[df_idx, RESULT_COLUMNS["trigger"]] = item.get("trigger", "")
-        df.loc[df_idx, RESULT_COLUMNS["executor"]] = item.get("executor", "")
-        df.loc[df_idx, RESULT_COLUMNS["step_description"]] = item.get("step_description", "")
-        df.loc[df_idx, RESULT_COLUMNS["mirapolis_action"]] = item.get("mirapolis_action", "")
-        df.loc[df_idx, "status"] = "done"
+        # ожидаем, что строка в df соответствует excel_row - 2 (первый data row = excel row 2)
+        df_idx = excel_row - 2
+        if df_idx < 0 or df_idx >= len(df):
+            logging.warning("row_index %s вне диапазона data frame (df length %s). Пропускаю запись в df.", excel_row, len(df))
+            continue
+        # если колонок нет в df — добавляем
+        for key in RESULT_COLUMNS.values():
+            if key not in df.columns:
+                df[key] = ""
+        df.at[df_idx, RESULT_COLUMNS["trigger"]] = item.get("trigger", "")
+        df.at[df_idx, RESULT_COLUMNS["executor"]] = item.get("executor", "")
+        df.at[df_idx, RESULT_COLUMNS["step_description"]] = item.get("step_description", "")
+        df.at[df_idx, RESULT_COLUMNS["mirapolis_action"]] = item.get("mirapolis_action", "")
+        df.at[df_idx, "status"] = "done"
+
 
 
 def process_excel(cfg: PipelineConfig) -> None:
@@ -501,6 +723,7 @@ def process_excel(cfg: PipelineConfig) -> None:
     wb = load_workbook(cfg.output_xlsx)
     process_sheet = get_process_sheet_name(wb)
     ensure_result_columns(wb, process_sheet)
+    ensure_input_headers_in_workbook(wb, process_sheet, REQUIRED_INPUT_COLS, aliases=ALIASES)
     wb.save(cfg.output_xlsx)
     df = load_dataframe(cfg.output_xlsx, process_sheet)
 
@@ -530,6 +753,7 @@ def process_excel(cfg: PipelineConfig) -> None:
             logging.info("Gemini вернул готовый XLSX: %s. Выполняю merge.", filled_path)
             new_wb = load_workbook(filled_path)
             merge_workbooks_preserve(wb, new_wb, process_sheet)
+            ensure_input_headers_in_workbook(wb, process_sheet, REQUIRED_INPUT_COLS, aliases=ALIASES)
             wb.save(cfg.output_xlsx)
 
             # Если в parsed были данные artifact1/2 — применяем их (если есть)
