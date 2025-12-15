@@ -15,6 +15,9 @@ from google import genai
 from google.genai import types
 from openpyxl import load_workbook
 from openpyxl import Workbook
+import base64
+from docx import Document
+import PyPDF2
 
 # Константы выходных колонок артефакта 1
 RESULT_COLUMNS = {
@@ -53,6 +56,7 @@ ALIASES = {
 
 ARTIFACT2_SHEET = "ФТ Mirapolis"
 
+from typing import Any, Dict, List, Tuple, Optional
 
 @dataclass
 class PipelineConfig:
@@ -65,6 +69,7 @@ class PipelineConfig:
     log_dir: str = "logs"
     state_dir: str = "snapshots"
     overwrite_input: bool = False
+    extra_files_dir: Optional[str] = None   # <-- новое поле
 
     @classmethod
     def from_env_and_args(cls) -> "PipelineConfig":
@@ -84,6 +89,8 @@ class PipelineConfig:
             default=os.getenv("OVERWRITE_INPUT", "false").lower() in ("1", "true", "yes"),
             help="Если задан, после каждого батча перезаписывать input.xlsx текущим output.xlsx",
         )
+        parser.add_argument("--extra-files-dir", dest="extra_files_dir", default=os.getenv("EXTRA_FILES_DIR", ""),
+            help="Папка с дополнительными файлами (docx/pdf/txt/иные). Файлы из этой папки будут отправлены модели.")
 
         args = parser.parse_args()
         api_key = args.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
@@ -104,6 +111,7 @@ class PipelineConfig:
             log_dir=args.log_dir,
             state_dir=args.state_dir,
             overwrite_input=args.overwrite_input,
+            extra_files_dir=args.extra_files_dir or None,
         )
 
 
@@ -395,8 +403,8 @@ class GeminiClient:
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
 
-    def call(self, prompt_text: str, batch_json: List[Dict[str, Any]], batch_idx: int) -> Dict[str, Any]:
-        system_instruction = "Верни только валидный JSON, без markdown, без пояснений, без текста вокруг. Язык значений — русский."
+    def call(self, prompt_text: str, batch_json: List[Dict[str, Any]], batch_idx: int, extra_files: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+        system_instruction = "Верни только валидный JSON, без markdown, без пояснений, без текста вокруг. Язык значений — русский. Учитывай дополнительные файлы (если они предоставлены) как источники информации для заполнения таблицы."
         contract = {
             "artifact1_rows": [
                 {
@@ -424,6 +432,27 @@ class GeminiClient:
             ],
         }
 
+        # Формируем секцию дополнительных файлов (только текст/короткие версии)
+        files_section = ""
+        if extra_files:
+            parts = []
+            for f in extra_files:
+                fname = f.get("filename", "unknown")
+                mime = f.get("mime", "unknown")
+                if f.get("text"):
+                    txt = f["text"]
+                    # Если текст слишком большой — обрезаем
+                    max_len = 75000
+                    if len(txt) > max_len:
+                        txt = txt[:max_len] + "\n\n[TRUNCATED]"
+                    parts.append(f"--- Файл: {fname} (mime: {mime}) ---\n{txt}")
+                elif f.get("base64"):
+                    # Base64 обычно слишком длинен; даём только метаданные
+                    parts.append(f"--- Файл (base64): {fname} (mime: {mime}) — base64-данные опущены для компактности. Если нужно, верни заполнённый xlsx в filled_xlsx_base64.")
+                else:
+                    parts.append(f"--- Файл: {fname} (mime: {mime}) — нет текстового содержимого ---")
+            files_section = "\n\n".join(parts)
+
         full_prompt = "\n\n".join(
             [
                 system_instruction,
@@ -433,7 +462,10 @@ class GeminiClient:
                 json.dumps(batch_json, ensure_ascii=False, indent=2),
             ]
         )
+        if files_section:
+            full_prompt += "\n\n--- Дополнительные файлы для изучения: ---\n" + files_section
 
+        # Логи
         input_log = os.path.join(self.log_dir, f"batch_{batch_idx}_input.json")
         raw_log = os.path.join(self.log_dir, f"batch_{batch_idx}_raw.txt")
         parsed_log = os.path.join(self.log_dir, f"batch_{batch_idx}_parsed.json")
@@ -445,10 +477,9 @@ class GeminiClient:
             try:
                 response = self.client.models.generate_content(model=self.model_name, contents=[full_prompt], config=self.config)
 
-                # --- robust extraction of textual/json content from various genai response shapes ---
+                # --- robust extraction (ваша существующая логика) ---
                 response_text = None
 
-                # 1) Если у response есть атрибут text
                 if hasattr(response, "text"):
                     r = getattr(response, "text")
                     if isinstance(r, str):
@@ -459,7 +490,6 @@ class GeminiClient:
                         except Exception:
                             response_text = str(r)
 
-                # 2) Попытка извлечь из .candidates / .outputs (варианты genai)
                 if response_text is None:
                     cand = getattr(response, "candidates", None)
                     if cand and isinstance(cand, (list, tuple)) and len(cand) > 0:
@@ -482,7 +512,6 @@ class GeminiClient:
                             else:
                                 response_text = str(first)
 
-                # 3) Если не удалось — строкифицируем весь объект
                 if response_text is None:
                     try:
                         response_text = str(response)
@@ -493,21 +522,20 @@ class GeminiClient:
                 with open(raw_log, "w", encoding="utf-8") as f:
                     f.write(response_text)
 
-                # Разчистим блок-код (```) и префиксы
+                # Очищаем backticks и префиксы
                 cleaned = response_text
                 if cleaned.startswith("```"):
                     cleaned = cleaned.strip("`").strip()
                     if cleaned.lower().startswith("json"):
                         cleaned = cleaned[4:].strip()
 
-                # Попытка парсинга JSON
                 parsed = None
                 try:
                     parsed = json.loads(cleaned)
                 except Exception:
                     parsed = None
 
-                # Если parsed - список — приводим к ожидаемой структуре
+                # Если parsed - список — привести к ожидаемой структуре
                 if isinstance(parsed, list):
                     logging.warning("Gemini вернул JSON-массив (list). Попытка привести к ожидаемой структуре.")
                     if all(isinstance(el, dict) and "row_index" in el for el in parsed):
@@ -535,14 +563,13 @@ class GeminiClient:
                         logging.warning("Ошибка декодирования base64 xlsx: %s", exc)
                         raise
 
-                # Нормальный JSON-случай (словарь)
                 if isinstance(parsed, dict):
                     logging.debug("Parsed gemini json keys: %s", list(parsed.keys()))
                     with open(parsed_log, "w", encoding="utf-8") as f:
                         json.dump(parsed, f, ensure_ascii=False, indent=2)
                     return parsed
 
-                # Если не распарсили JSON — пробуем определить, не base64 ли это xlsx
+                # Попытка распознать base64 xlsx в raw тексте
                 text = cleaned.strip()
                 if len(text) > 300 and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n" for c in text[:200]):
                     try:
@@ -556,7 +583,6 @@ class GeminiClient:
                     except Exception:
                         pass
 
-                # Если ничего не подошло — сохраняем raw и пробуем дальше
                 with open(parsed_log, "w", encoding="utf-8") as f:
                     json.dump({"raw_text": response_text}, f, ensure_ascii=False, indent=2)
                 raise RuntimeError("Не удалось получить валидный JSON/файл от Gemini после разбора.")
@@ -566,6 +592,7 @@ class GeminiClient:
                 time.sleep(15)
 
         raise RuntimeError("Не удалось получить валидный JSON/файл от Gemini после 3 попыток.")
+
 
 
 
@@ -730,6 +757,71 @@ def process_excel(cfg: PipelineConfig) -> None:
     batch_idx = 1
     client = GeminiClient(cfg.gemini_api_key, cfg.gemini_model, cfg.log_dir)
 
+    # ----------------- Подготовка дополнительных файлов -----------------
+    extra_files_payload = []
+    if cfg.extra_files_dir:
+        extra_dir = cfg.extra_files_dir
+        if os.path.isdir(extra_dir):
+            logging.info("Загружаю дополнительные файлы из: %s", extra_dir)
+            files = sorted(os.listdir(extra_dir))
+            for fname in files:
+                fpath = os.path.join(extra_dir, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                try:
+                    # DOCX
+                    if ext == ".docx":
+                        try:
+                            from docx import Document
+                            doc = Document(fpath)
+                            text = "\n".join([p.text for p in doc.paragraphs if p.text])
+                            extra_files_payload.append({"filename": fname, "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text": text})
+                        except Exception as e:
+                            logging.warning("Не удалось прочитать docx %s: %s. Отправлю как base64.", fpath, e)
+                            with open(fpath, "rb") as ff:
+                                b64 = base64.b64encode(ff.read()).decode("ascii")
+                            extra_files_payload.append({"filename": fname, "mime": "application/octet-stream", "base64": b64})
+                    # PDF
+                    elif ext == ".pdf":
+                        try:
+                            import PyPDF2
+                            text = ""
+                            with open(fpath, "rb") as ff:
+                                reader = PyPDF2.PdfReader(ff)
+                                for page in reader.pages:
+                                    text += "\n" + (page.extract_text() or "")
+                            extra_files_payload.append({"filename": fname, "mime": "application/pdf", "text": text})
+                        except Exception as e:
+                            logging.warning("Не удалось прочитать pdf %s: %s. Отправлю как base64.", fpath, e)
+                            with open(fpath, "rb") as ff:
+                                b64 = base64.b64encode(ff.read()).decode("ascii")
+                            extra_files_payload.append({"filename": fname, "mime": "application/octet-stream", "base64": b64})
+                    # TXT / MD
+                    elif ext in (".txt", ".md"):
+                        try:
+                            with open(fpath, "r", encoding="utf-8") as ff:
+                                text = ff.read()
+                            extra_files_payload.append({"filename": fname, "mime": "text/plain", "text": text})
+                        except Exception as e:
+                            logging.warning("Ошибка чтения текстового файла %s: %s. Отправлю как base64.", fpath, e)
+                            with open(fpath, "rb") as ff:
+                                b64 = base64.b64encode(ff.read()).decode("ascii")
+                            extra_files_payload.append({"filename": fname, "mime": "application/octet-stream", "base64": b64})
+                    # XLSX/XLS и прочие бинарные — отправляем base64
+                    else:
+                        with open(fpath, "rb") as ff:
+                            b64 = base64.b64encode(ff.read()).decode("ascii")
+                        extra_files_payload.append({"filename": fname, "mime": "application/octet-stream", "base64": b64})
+                    logging.info("Подготовлен файл %s (ext=%s).", fname, ext)
+                except Exception as exc:
+                    logging.warning("Ошибка при обработке доп. файла %s: %s", fpath, exc)
+        else:
+            logging.warning("Папка с дополнительными файлами не существует: %s", extra_dir)
+    else:
+        logging.info("Дополнительная папка файлов не указана.")
+    # -------------------------------------------------------------------
+
     while True:
         batch_df = select_batch(df, cfg.batch_size)
         if batch_df.empty:
@@ -745,7 +837,7 @@ def process_excel(cfg: PipelineConfig) -> None:
         batch_df.to_csv(pre_batch_csv, index=False, encoding="utf-8-sig")
         logging.info("Сохранили входной CSV батча: %s", pre_batch_csv)
 
-        response = client.call(prompt_text, payload, batch_idx)
+        response = client.call(prompt_text, payload, batch_idx, extra_files=extra_files_payload)
 
         # Если Gemini вернул файл xlsx
         if isinstance(response, dict) and response.get("filled_xlsx_path"):

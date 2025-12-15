@@ -107,3 +107,5 @@ wsproto==1.2.0
 yarl==1.18.3
 zeep==4.3.1
 zipp==3.19.2
+python-docx>=0.8.11
+PyPDF2>=3.0.0
