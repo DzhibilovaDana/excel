@@ -197,9 +197,45 @@ def is_row_processed(row: pd.Series) -> bool:
     return True
 
 
-def select_batch(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
-    unprocessed = df[~df.apply(is_row_processed, axis=1)]
-    return unprocessed.head(batch_size)
+def select_batch_by_l4(df: pd.DataFrame, batch_size: int = None) -> pd.DataFrame:
+    """
+    Находит первую непроцессированную строку и выбирает
+    все последующие строки, относящиеся к тому же L4 (непрерывный блок).
+    """
+    # 1. Находим индекс первой необработанной строки
+    mask_unprocessed = ~df.apply(is_row_processed, axis=1)
+    if not mask_unprocessed.any():
+        return df.iloc[0:0]
+
+    first_unprocessed_idx = mask_unprocessed[mask_unprocessed].index[0]
+    
+    # 2. Получаем значение L4 этой строки
+    l4_value = df.at[first_unprocessed_idx, "L4"]
+    
+    # Если L4 пустой, берем просто batch_size строк (fallback)
+    if _is_empty_cell(l4_value):
+        return df.loc[first_unprocessed_idx:].head(batch_size or 10)
+
+    # 3. Идем вниз от первой строки и собираем все строки с таким же L4
+    # (пока не встретим другой L4 или конец файла)
+    indices = []
+    l4_str_target = str(l4_value).strip()
+    
+    # Срез df начиная с найденной строки до конца
+    subset = df.loc[first_unprocessed_idx:]
+    
+    for idx, row in subset.iterrows():
+        current_l4 = str(row.get("L4", "")).strip()
+        if current_l4 == l4_str_target:
+            indices.append(idx)
+        else:
+            # Как только L4 изменился — останавливаемся. 
+            # Это гарантирует, что мы берем только текущий процесс.
+            break
+            
+    return df.loc[indices]
+
+
 
 def _normalize(name: str) -> str:
     if not isinstance(name, str):
@@ -337,53 +373,50 @@ def ensure_input_headers_in_workbook(wb, process_sheet: str, required_cols: list
             ws.cell(row=1, column=ws.max_column + 1).value = req
 
 
-
-def build_batch_payload(batch_df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """
-    Построение JSON-пейлоада для батча. Функция теперь толерантна к названиям колонок:
-    она попытается сопоставить нужные колонки по нормализованным именам и создать недостающие.
-    """
+def build_batch_payload_for_l4(batch_df: pd.DataFrame) -> Dict[str, Any]:
     required_cols = [
-        "L1",
-        "L2",
-        "L3",
-        "L4",
-        "L5",
-        "Mirapolis L4 (Да/Нет)",
-        "Ответ Клиента",
-        "Комментарии/уточнения",
-        "Комментарии со встреч",
-        "Проблема текущего состояния",
-        "Предложение по решению /улучшению HCM",
+        "L1", "L2", "L3", "L4", "L5", "Mirapolis L4 (Да/Нет)",
+        "Ответ Клиента", "Комментарии/уточнения", "Комментарии со встреч",
+        "Проблема текущего состояния", "Предложение по решению /улучшению HCM",
         "Функциональные требования",
     ]
-
-    # Приводим batch_df к версии с гарантированными колонками
     batch_df = _ensure_columns(batch_df, required_cols)
-    logging.debug("Batch columns after ensure: %s", list(batch_df.columns))
-    # Теперь строим payload (как раньше), опираясь на стандартные имена
-    payload = []
+    if batch_df.empty:
+        return {"process_l4_name": "", "first_row_excel_index": None, "rows": []}
+
+    first_df_idx = int(batch_df.index.min())
+    first_row_excel_index = first_df_idx + 2  # Excel row index (1-based + header)
+    process_l4_name = str(batch_df.at[first_df_idx, "L4"] or "")
+
+    rows = []
     for idx, row in batch_df.iterrows():
-        excel_row_index = int(idx) + 2  # +2: смещение на заголовок
-        payload.append(
-            {
-                "row_index": excel_row_index,
-                "l2_name": row.get("L2", ""),
-                "L1": row.get("L1", ""),
-                "L2": row.get("L2", ""),
-                "L3": row.get("L3", ""),
-                "L4": row.get("L4", ""),
-                "L5": row.get("L5", ""),
-                "Mirapolis_L4": row.get("Mirapolis L4 (Да/Нет)", ""),
-                "Ответ_Клиента": row.get("Ответ Клиента", ""),
-                "Комментарии_уточнения": row.get("Комментарии/уточнения", ""),
-                "Комментарии_со_встреч": row.get("Комментарии со встреч", ""),
-                "Проблема_текущего_состояния": row.get("Проблема текущего состояния", ""),
-                "Предложение_по_решению": row.get("Предложение по решению /улучшению HCM", ""),
-                "Функциональные_требования": row.get("Функциональные требования", ""),
-            }
-        )
-    return payload
+        excel_row_index = int(idx) + 2
+        rows.append({
+            "row_index": excel_row_index,
+            "l2_name": row.get("L2", ""),
+            "L1": row.get("L1", ""),
+            "L2": row.get("L2", ""),
+            "L3": row.get("L3", ""),
+            "L4": row.get("L4", ""),
+            "L5": row.get("L5", ""),
+            "Mirapolis_L4": row.get("Mirapolis L4 (Да/Нет)", ""),
+            "Ответ_Клиента": row.get("Ответ Клиента", ""),
+            "Комментарии_уточнения": row.get("Комментарии/уточнения", ""),
+            "Комментарии_со_встреч": row.get("Комментарии со встреч", ""),
+            "Проблема_текущего_состояния": row.get("Проблема текущего состояния", ""),
+            "Предложение_по_решению": row.get("Предложение по решению /улучшению HCM", ""),
+            "Функциональные_требования": row.get("Функциональные требования", ""),
+            # мета
+            "process_l4_name": process_l4_name,
+            "first_row_excel_index": first_row_excel_index,
+            "is_first_in_l4": excel_row_index == first_row_excel_index,
+        })
+    return {
+        "process_l4_name": process_l4_name,
+        "first_row_excel_index": first_row_excel_index,
+        "rows": rows,
+    }
+
 
 
 class GeminiClient:
@@ -404,35 +437,30 @@ class GeminiClient:
         os.makedirs(self.log_dir, exist_ok=True)
 
     def call(self, prompt_text: str, batch_json: List[Dict[str, Any]], batch_idx: int, extra_files: List[Dict[str, Any]] = None) -> Dict[str, Any]:
-        system_instruction = "Верни только валидный JSON, без markdown, без пояснений, без текста вокруг. Язык значений — русский. Учитывай дополнительные файлы (если они предоставлены) как источники информации для заполнения таблицы."
+        system_instruction = (
+            "Верни только валидный JSON, без markdown, без пояснений и без дополнительного текста. "
+            "Язык значений — русский. Учитывай дополнительные файлы (если они предоставлены) как источники информации. "
+            "ВАЖНО: входные данные представляют собой одну группу строк одного процесса L4 и содержат поля "
+            "`process_l4_name` (строка), `first_row_excel_index` (целое, индекс первой строки Excel этой группы) и `rows` (массив объектов по строкам). "
+            "Требование: верни ровно одну запись в `artifact1_rows` для этой группы. Поле `row_index` в этой записи обязано быть равно `first_row_excel_index`. "
+            "Модель должна использовать всю информацию из массива `rows` и все дополнительные файлы при формировании значений полей `trigger`, `executor`, "
+            "`step_description`, `mirapolis_action`. НЕ возвращай записи `artifact1_rows` для других row_index в группе — такие записи будут игнорироваться. "
+            "Допускается возвращать `artifact2_by_l2` как объект требований по L2 в формате, описанном ниже, если это необходимо."
+        )
         contract = {
             "artifact1_rows": [
                 {
                     "row_index": 123,
                     "process_l4_name": "...",
-                    "trigger": "...",
-                    "executor": "...",
-                    "step_description": "...",
-                    "mirapolis_action": "...",
+                    "trigger": "...",           # Инициирующее событие (строка)
+                    "executor": "...",          # Исполнитель (строка)
+                    "step_description": "...",  # Описание шага (строка)
+                    "mirapolis_action": "..."   # Действие в системе (строка)
                 }
-            ],
-            "artifact2_by_l2": [
-                {
-                    "l2_name": "...",
-                    "requirements": {
-                        "data_master": ["..."],
-                        "ui_forms": ["..."],
-                        "business_logic": ["..."],
-                        "approval_routing": ["..."],
-                        "integrations": ["..."],
-                        "reporting_analytics": ["..."],
-                        "security_access": ["..."],
-                    },
-                }
-            ],
+            ]
         }
 
-        # Формируем секцию дополнительных файлов (только текст/короткие версии)
+        # Формирование секции дополнительных файлов (оставляем вашу текущую логику)
         files_section = ""
         if extra_files:
             parts = []
@@ -441,27 +469,30 @@ class GeminiClient:
                 mime = f.get("mime", "unknown")
                 if f.get("text"):
                     txt = f["text"]
-                    # Если текст слишком большой — обрезаем
                     max_len = 75000
                     if len(txt) > max_len:
-                        txt = txt[:max_len] + "\n\n[TRUNCATED]"
+                        txt = txt[:max_len] + "..."
                     parts.append(f"--- Файл: {fname} (mime: {mime}) ---\n{txt}")
                 elif f.get("base64"):
-                    # Base64 обычно слишком длинен; даём только метаданные
-                    parts.append(f"--- Файл (base64): {fname} (mime: {mime}) — base64-данные опущены для компактности. Если нужно, верни заполнённый xlsx в filled_xlsx_base64.")
+                    parts.append(f"--- Файл (base64): {fname} (mime: {mime}) — base64-данные опущены. ---")
                 else:
                     parts.append(f"--- Файл: {fname} (mime: {mime}) — нет текстового содержимого ---")
             files_section = "\n\n".join(parts)
 
-        full_prompt = "\n\n".join(
-            [
-                system_instruction,
-                prompt_text,
-                "Ожидаемый JSON:\n" + json.dumps(contract, ensure_ascii=False, indent=2),
-                "Вот данные (первичный источник, массив объектов):",
-                json.dumps(batch_json, ensure_ascii=False, indent=2),
-            ]
-        )
+        # Полный промт: системная инструкция, пользовательский промт, описание структуры входных данных, ожидаемый JSON и сами данные
+        full_prompt_parts = [
+            system_instruction,
+            prompt_text,
+            "Структура входных данных (объект JSON):",
+            # тут показываем точную структуру (для модели), но это служебная информация — можно оставить шаблон
+            json.dumps({"process_l4_name": "STRING", "first_row_excel_index": 123, "rows": [{"row_index": 123, "L1": "...", "L2": "...", "...": "..."}]}, ensure_ascii=False, indent=2),
+            "Ожидаемый JSON (строгая схема):",
+            json.dumps(contract, ensure_ascii=False, indent=2),
+            "Вот данные (первичный источник, объект):",
+            json.dumps(batch_json, ensure_ascii=False, indent=2),
+        ]
+        full_prompt = "\n\n".join(full_prompt_parts)
+
         if files_section:
             full_prompt += "\n\n--- Дополнительные файлы для изучения: ---\n" + files_section
 
@@ -610,9 +641,8 @@ def ensure_result_columns(wb, process_sheet: str) -> None:
             logging.info("Добавлена результирующая колонка '%s' в sheet %s", col_name, process_sheet)
 
 
-def apply_artifact1_rows(wb, process_sheet: str, artifact_rows: List[Dict[str, Any]]) -> None:
+def apply_artifact1_rows(wb, process_sheet: str, artifact_rows: List[Dict[str, Any]], allowed_first_row_index: int = None) -> None:
     ws = wb[process_sheet]
-    # строим карту нормализованных заголовков
     header_map = build_header_map(ws)
     # Для быстрых обращений: норм -> column index (если нет — создадим)
     for canonical in RESULT_COLUMNS.values():
@@ -629,7 +659,12 @@ def apply_artifact1_rows(wb, process_sheet: str, artifact_rows: List[Dict[str, A
         except Exception:
             logging.warning("Некорректный row_index в артефакте: %s", item.get("row_index"))
             continue
-        # Запись значений
+
+        # Если указан allowed_first_row_index — пропускаем записи для других индексов
+        if allowed_first_row_index is not None and row_idx != int(allowed_first_row_index):
+            logging.info("Пропускаю запись artifact1 для row %s — не первая строка L4 (allowed=%s).", row_idx, allowed_first_row_index)
+            continue
+
         def write_col(key_name, value):
             target_col_name = RESULT_COLUMNS[key_name]
             norm = _normalize(target_col_name)
@@ -823,73 +858,88 @@ def process_excel(cfg: PipelineConfig) -> None:
     # -------------------------------------------------------------------
 
     while True:
-        batch_df = select_batch(df, cfg.batch_size)
+        # 1. Выбираем батч (один процесс L4 целиком)
+        batch_df = select_batch_by_l4(df, cfg.batch_size)
         if batch_df.empty:
             logging.info("Необработанных строк нет.")
             break
 
-        payload = build_batch_payload(batch_df)
+        logging.info("Обработка батча %d. L4='%s'. Строк: %d (Excel row %d)", 
+                     batch_idx, 
+                     batch_df.iloc[0].get("L4"), 
+                     len(batch_df),
+                     int(batch_df.index[0]) + 2)
+
+        # собираем payload
+        batch_payload = build_batch_payload_for_l4(batch_df)
+
         with open(cfg.prompt_file, "r", encoding="utf-8") as f:
             prompt_text = f.read()
 
-        # Сохраняем pre-batch CSV
+        # CSV лог
         pre_batch_csv = os.path.join(cfg.log_dir, f"batch_{batch_idx}_pre.csv")
         batch_df.to_csv(pre_batch_csv, index=False, encoding="utf-8-sig")
-        logging.info("Сохранили входной CSV батча: %s", pre_batch_csv)
 
-        response = client.call(prompt_text, payload, batch_idx, extra_files=extra_files_payload)
+        # Вызов API
+        try:
+            response = client.call(prompt_text, batch_payload, batch_idx, extra_files=extra_files_payload)
+        except Exception as e:
+            logging.error("Критическая ошибка при вызове Gemini для батча %s: %s", batch_idx, e)
+            # Можно прервать или пропустить, но лучше break, чтобы не крутить бесконечно
+            break
 
-        # Если Gemini вернул файл xlsx
+        first_row_idx = batch_payload.get("first_row_excel_index")
+
+        # --- ОБРАБОТКА ОТВЕТА ---
         if isinstance(response, dict) and response.get("filled_xlsx_path"):
+            # Если вернулся файл
             filled_path = response["filled_xlsx_path"]
-            logging.info("Gemini вернул готовый XLSX: %s. Выполняю merge.", filled_path)
+            logging.info("Gemini вернул готовый XLSX. Merge...")
             new_wb = load_workbook(filled_path)
             merge_workbooks_preserve(wb, new_wb, process_sheet)
             ensure_input_headers_in_workbook(wb, process_sheet, REQUIRED_INPUT_COLS, aliases=ALIASES)
+            
+            # Обновляем df и сохраняем
             wb.save(cfg.output_xlsx)
-
-            # Если в parsed были данные artifact1/2 — применяем их (если есть)
+            df = load_dataframe(cfg.output_xlsx, process_sheet) # Перечитываем статусы
+            
+        else:
+            # Если вернулся JSON
             artifact1_rows = response.get("artifact1_rows", [])
-            if artifact1_rows:
-                apply_artifact1_rows(wb, process_sheet, artifact1_rows)
-                update_dataframe_with_artifact1(df, artifact1_rows)
             artifact2_by_l2 = response.get("artifact2_by_l2", [])
+            
+            # Фильтруем (на всякий случай, хотя промт запрещает лишние)
+            if first_row_idx is not None:
+                artifact1_rows = [r for r in artifact1_rows if int(r.get("row_index", -1)) == int(first_row_idx)]
+            
+            if artifact1_rows:
+                apply_artifact1_rows(wb, process_sheet, artifact1_rows, allowed_first_row_index=first_row_idx)
+                update_dataframe_with_artifact1(df, artifact1_rows)
+            
             if artifact2_by_l2:
                 merge_artifact2_sheet(wb, artifact2_by_l2)
 
-            wb.save(cfg.output_xlsx)
-            snapshot_path = os.path.join(cfg.state_dir, f"output_batch_{batch_idx}.xlsx")
-            wb.save(snapshot_path)
-            logging.info("Батч %s обработан (xlsx-ответ), снапшот: %s", batch_idx, snapshot_path)
-            # Обновляем df из нового output
-            df = load_dataframe(cfg.output_xlsx, process_sheet)
-
-        else:
-            # Обычная логика: JSON-ответы
-            artifact1_rows = response.get("artifact1_rows", [])
-            artifact2_by_l2 = response.get("artifact2_by_l2", [])
-            apply_artifact1_rows(wb, process_sheet, artifact1_rows)
-            update_dataframe_with_artifact1(df, artifact1_rows)
-            merge_artifact2_sheet(wb, artifact2_by_l2)
+            # --- ВАЖНОЕ ИСПРАВЛЕНИЕ: ПОМЕЧАЕМ ВЕСЬ БАТЧ КАК "DONE" ---
+            # Даже если мы записали ответ только в 1-ю строку, 
+            # мы считаем, что ВЕСЬ L4 процесс обработан.
+            # Иначе на следующем шаге select_batch_by_l4 возьмет 2-ю строку этого же L4.
+            for idx in batch_df.index:
+                df.at[idx, "status"] = "done"
 
             wb.save(cfg.output_xlsx)
             snapshot_path = os.path.join(cfg.state_dir, f"output_batch_{batch_idx}.xlsx")
             wb.save(snapshot_path)
-            logging.info("Батч %s обработан, снапшот: %s", batch_idx, snapshot_path)
+            logging.info("Батч %s обработан. Снапшот: %s", batch_idx, snapshot_path)
 
-        # Сохраняем пост-batch CSV
+        # Сохранение и перезапись input (как было у тебя)
         post_batch_csv = os.path.join(cfg.log_dir, f"batch_{batch_idx}_post.csv")
         df.to_csv(post_batch_csv, index=False, encoding="utf-8-sig")
-        logging.info("Сохранили выходной CSV батча: %s", post_batch_csv)
 
-        # Если требуется перезаписать input.xlsx текущим output
         if cfg.overwrite_input:
             try:
                 if os.path.abspath(cfg.input_xlsx) != os.path.abspath(cfg.output_xlsx):
                     shutil.copyfile(cfg.output_xlsx, cfg.input_xlsx)
-                    logging.info("Перезаписан исходный файл input.xlsx новой версией output.xlsx")
-            except Exception as exc:
-                logging.warning("Не удалось перезаписать input.xlsx: %s", exc)
+            except Exception: pass
 
         batch_idx += 1
 
